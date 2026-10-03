@@ -109,6 +109,41 @@ class InferenceTests(unittest.TestCase):
         self.assertEqual(result['forecastOrigin'],'2026-10-02')
         self.assertEqual(result['lastActualClose'],df.Close.iloc[-1])
 
+    def test_api_preserves_validation_status_and_unexpected_failures(self):
+        import traceback
+        class HttpError(Exception):
+            def __init__(self,status_code,detail):
+                self.status_code,self.detail=status_code,detail
+                super().__init__(detail)
+        complete=self.frame()
+        missing=complete.copy()
+        missing.iloc[-1,missing.columns.get_loc('Volume')]=np.nan
+        infinite=complete.copy()
+        infinite.iloc[-1,infinite.columns.get_loc('Volume')]=np.inf
+        missing_close=complete.copy()
+        missing_close.iloc[-1,missing_close.columns.get_loc('Close')]=np.nan
+        def unexpected(_):
+            raise RuntimeError('provider unavailable')
+        for label,loader,scaler_exists,status,detail in (
+            ('missing latest',lambda _:missing,True,400,'Latest observation has incomplete features'),
+            ('nonfinite latest',lambda _:infinite,True,400,'Latest observation has incomplete features'),
+            ('missing close',lambda _:missing_close,True,400,'Latest observation has incomplete features'),
+            ('insufficient history',lambda _:complete.iloc[:10],True,400,'Latest observation has incomplete features'),
+            ('short valid history',lambda _:complete.iloc[:40],True,400,'Not enough data for prediction'),
+            ('missing scaler',lambda _:complete,False,404,'Feature scaler not found'),
+            ('unexpected failure',unexpected,True,500,'provider unavailable'),
+        ):
+            with self.subTest(case=label):
+                ns={'check_model_exists':lambda _:True,'validate_bundle':lambda *_:None,'MODEL_DIR':'.',
+                    'load_stock_data':loader,'prepare_features':self.features(),'SEQUENCE_LENGTH':30,
+                    'logger':logging.getLogger('test'),'traceback':traceback,
+                    'os':type('OS',(),{'path':type('Path',(),{'join':lambda *parts:'/'.join(parts),'exists':lambda _:scaler_exists})}),
+                    'HTTPException':HttpError,'Depends':lambda _:None,'get_session':lambda:None}
+                api=function('main.py','predict',ns)
+                with self.assertRaises(HttpError) as caught:
+                    api('TEST',object())
+                self.assertEqual((caught.exception.status_code,caught.exception.detail),(status,detail))
+
     def test_bundle_rejects_legacy_and_mixed_artifacts(self):
         with tempfile.TemporaryDirectory() as work:
             with self.assertRaisesRegex(ValueError,'Legacy'):

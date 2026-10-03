@@ -146,6 +146,8 @@ def predict(symbol: str, session: Session = Depends(get_session)) -> Dict:
         features, _, feature_cols = prepare_features(df.copy(),include_targets=False)
         if features.empty or features.index[-1]!=df.index[-1]:
             raise HTTPException(status_code=400,detail='Latest observation has incomplete features')
+        if len(features)<SEQUENCE_LENGTH:
+            raise HTTPException(status_code=400,detail='Not enough data for prediction')
         logger.info(f"Feature columns: {feature_cols}")
         
         # Load feature scaler
@@ -196,6 +198,8 @@ def predict(symbol: str, session: Session = Depends(get_session)) -> Dict:
             "error": False
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in predict: {str(e)}")
         logger.error(traceback.format_exc())
