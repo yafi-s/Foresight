@@ -22,6 +22,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 from data_loader import load_stock_data, prepare_features
+from causal import prepare_inference
+from artifact_protocol import validate_bundle
 from model import (
     load_trained_model,
     predict_next_week,
@@ -131,6 +133,9 @@ def predict(symbol: str, session: Session = Depends(get_session)) -> Dict:
                 "message": f"Model not available for {symbol}. Please refer to the README for training instructions."
             }
         
+        # Old/mixed artifacts do not have the repaired training input contract.
+        validate_bundle(MODEL_DIR,symbol)
+
         # Load data
         logger.info("Loading stock data...")
         df = load_stock_data(symbol)
@@ -138,7 +143,9 @@ def predict(symbol: str, session: Session = Depends(get_session)) -> Dict:
         
         # Prepare features
         logger.info("Preparing features...")
-        features, _, feature_cols = prepare_features(df)
+        features, _, feature_cols = prepare_features(df.copy(),include_targets=False)
+        if features.empty or features.index[-1]!=df.index[-1]:
+            raise HTTPException(status_code=400,detail='Latest observation has incomplete features')
         logger.info(f"Feature columns: {feature_cols}")
         
         # Load feature scaler
@@ -147,20 +154,10 @@ def predict(symbol: str, session: Session = Depends(get_session)) -> Dict:
             raise HTTPException(status_code=404, detail="Feature scaler not found")
         feature_scaler = joblib.load(feature_scaler_path)
         
-        # Scale features
-        scaled_features = feature_scaler.transform(features)
-        
-        # Get last sequence
-        if len(scaled_features) < SEQUENCE_LENGTH:
-            raise HTTPException(status_code=400, detail=f"Not enough data for prediction")
-        last_sequence = scaled_features[-SEQUENCE_LENGTH:]
-        
-        # Get last close price and add it as a feature
-        last_close = float(df["Close"].iloc[-1])
-        # Create a sequence of last close prices with the same length as the sequence
-        last_close_sequence = np.full((SEQUENCE_LENGTH, 1), last_close)
-        last_sequence = np.concatenate([last_sequence, last_close_sequence], axis=1)
-        last_sequence = last_sequence.reshape(1, SEQUENCE_LENGTH, last_sequence.shape[1])
+        closes=df.loc[features.index,'Close'].to_numpy()
+        last_sequence=prepare_inference(features.to_numpy(),closes,feature_scaler,SEQUENCE_LENGTH)
+        last_close=float(closes[-1])
+        origin_date=features.index[-1].strftime('%Y-%m-%d')
         
         # Load model and target scaler
         model = load_trained_model(symbol)
@@ -168,7 +165,7 @@ def predict(symbol: str, session: Session = Depends(get_session)) -> Dict:
         target_scaler = joblib.load(target_scaler_path)
         
         # Get predictions
-        predictions = predict_next_week(model, target_scaler, last_sequence, last_close)
+        predictions = predict_next_week(model,target_scaler,last_sequence,last_close,origin_date=origin_date)
         
         if not predictions or not predictions.get("predictions"):
             raise HTTPException(status_code=500, detail="Failed to generate predictions")
@@ -188,6 +185,8 @@ def predict(symbol: str, session: Session = Depends(get_session)) -> Dict:
             "symbol": symbol,
             "lastActualClose": last_close,
             "lastUpdated": df.index[-1].strftime("%Y-%m-%d"),
+            "forecastOrigin": origin_date,
+            "dateBasis": predictions['date_basis'],
             "mape": None,  # Will be calculated when actual prices are known
             "predictions": {
                 "dates": predictions["dates"],
@@ -291,4 +290,4 @@ def update_actual_prices(session: Session = Depends(get_session)) -> Dict:
 
 if __name__ == "__main__":
     # Use reload=False when deploying or running in production
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

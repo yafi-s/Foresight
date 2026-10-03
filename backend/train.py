@@ -17,7 +17,9 @@ from tensorflow.keras.layers import Input, LSTM, BatchNormalization, Dropout, De
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from data_loader import load_stock_data, prepare_features, PREDICTION_DAYS
-from model import create_sequences, AttentionLayer
+from model import AttentionLayer
+from causal import prepare_split, prices_from_returns
+from artifact_protocol import write_bundle_metadata
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import matplotlib.pyplot as plt
 from multiprocessing import cpu_count
@@ -27,7 +29,7 @@ from multiprocessing import cpu_count
 tf.config.optimizer.set_jit(True)
 
 # Configure thread pools to use all available CPU cores
-NUM_THREADS = cpu_count()
+NUM_THREADS = min(2, cpu_count())
 tf.config.threading.set_intra_op_parallelism_threads(NUM_THREADS)
 tf.config.threading.set_inter_op_parallelism_threads(NUM_THREADS)
 
@@ -61,16 +63,8 @@ class TrainingMonitor(tf.keras.callbacks.Callback):
         y_val_pred_scaled = self.model.predict(self.X_val, verbose=0)
         
         # Unscale returns
-        y_val_true_unscaled_returns = self.target_scaler.inverse_transform(self.y_val)
-        y_val_pred_unscaled_returns = self.target_scaler.inverse_transform(y_val_pred_scaled)
-        
-        # Apply volatility adjustment
-        vol_idx = self.feature_cols.index('Volatility')
-        vols = self.X_val[:, -1, vol_idx]
-        vols_norm = (vols - vols.mean()) / (vols.std() + 1e-6)
-        alpha = 0.5  # control volatility scaling
-        scaling = 1 + alpha * vols_norm
-        y_val_pred_unscaled_returns = y_val_pred_unscaled_returns * scaling[:, None]
+        y_val_true_unscaled_returns = self.target_scaler.inverse_transform(self.y_val.reshape(-1, 1)).reshape(self.y_val.shape)
+        y_val_pred_unscaled_returns = self.target_scaler.inverse_transform(y_val_pred_scaled.reshape(-1, 1)).reshape(y_val_pred_scaled.shape)
         
         # Calculate prices
         last_close_feature_index = self.X_val.shape[2] - 1
@@ -308,53 +302,17 @@ def main():
     X_df_processed, y_df_processed, feature_cols = prepare_features(df.copy())
     logger.info(f"X_df_processed shape: {X_df_processed.shape}, y_df_processed shape: {y_df_processed.shape}")
 
-    # Scale features
-    feature_scaler = StandardScaler()
-    X_scaled = feature_scaler.fit_transform(X_df_processed)
-
-    # Get the original indices corresponding to the start of each row in X_scaled
-    original_indices_of_X_scaled = X_df_processed.index.tolist()
-
-    # Calculate indices for last closes
-    indices_for_last_closes = []
-    for idx in original_indices_of_X_scaled:
-        pos = df.index.get_loc(idx)
-        if pos + SEQUENCE_LENGTH - 1 < len(df):
-            indices_for_last_closes.append(df.index[pos + SEQUENCE_LENGTH - 1])
-
-    # Ensure indices_for_last_closes do not exceed the bounds of the original df
-    valid_indices_for_last_closes = [idx for idx in indices_for_last_closes if idx <= df.index.max()]
-
-    if len(valid_indices_for_last_closes) == 0:
-        raise ValueError("No valid sequences could be created with the current data")
-
-    # Extract the last closing prices
-    aligned_last_closes = df.loc[valid_indices_for_last_closes, 'Close'].values.reshape(-1, 1)
-
-    # Concatenate the last close feature
-    X_scaled_with_last_close = np.concatenate([X_scaled[:len(aligned_last_closes)], aligned_last_closes], axis=1)
-    y_raw = y_df_processed.iloc[:len(aligned_last_closes)].values
-
-    logger.info(f"X_scaled shape with last close feature: {X_scaled_with_last_close.shape}")
-    logger.info(f"y_raw shape: {y_raw.shape}")
-
-    # Create sequences
-    X_seq, y_seq = create_sequences(X_scaled_with_last_close, y_raw, SEQUENCE_LENGTH, step=1)
-    logger.info(f"After sequencing: X_seq {X_seq.shape}, y_seq {y_seq.shape}")
-
-    # Scale target values
-    target_scaler = StandardScaler()
-    y_scaled = target_scaler.fit_transform(y_seq.reshape(-1, 1)).reshape(y_seq.shape)
-    logger.info(f"y_seq shape before scaling: {y_seq.shape}, y_scaled shape: {y_scaled.shape}")
-
-    # Split data
-    split_idx = int(len(X_seq) * 0.8)
-    X_train, X_val = X_seq[:split_idx], X_seq[split_idx:]
-    y_train, y_val = y_seq[:split_idx], y_seq[split_idx:]
-
-    logger.info(f"Train samples: {X_train.shape[0]}, Val samples: {X_val.shape[0]}")
-    logger.info(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
-    logger.info(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
+    positions = df.index.get_indexer(X_df_processed.index)
+    split = prepare_split(
+        X_df_processed.values, y_df_processed.values,
+        df.loc[X_df_processed.index, 'Close'].values, positions,
+        sequence_length=SEQUENCE_LENGTH,
+    )
+    X_train, X_val = split.X_train, split.X_val
+    y_train, y_val = split.y_train, split.y_val
+    feature_scaler, target_scaler = split.feature_scaler, split.target_scaler
+    logger.info("Causal v2 split: %d train, %d validation, %d horizon-overlap samples purged",
+                len(X_train), len(X_val), split.purged_samples)
 
     # Train model
     model = train_model(
@@ -368,21 +326,15 @@ def main():
         target_scaler=target_scaler,
         epochs=args.epochs
     )
+    # Marker is written only after a causal split and complete model/scaler save.
+    write_bundle_metadata('models',args.symbol,feature_cols)
 
     # Evaluate on validation set
     y_val_pred_scaled = model.predict(X_val, verbose=0)
 
     # Unscale returns
-    y_val_true_unscaled_returns = target_scaler.inverse_transform(y_val)
-    y_val_pred_unscaled_returns = target_scaler.inverse_transform(y_val_pred_scaled)
-
-    # Apply volatility adjustment
-    vol_idx = feature_cols.index('Volatility')
-    vols = X_val[:, -1, vol_idx]
-    vols_norm = (vols - vols.mean()) / (vols.std() + 1e-6)
-    alpha = 0.5  # Adjust this to control volatility scaling
-    scaling = 1 + alpha * vols_norm
-    y_val_pred_unscaled_returns = y_val_pred_unscaled_returns * scaling[:, None]
+    y_val_true_unscaled_returns = target_scaler.inverse_transform(y_val.reshape(-1, 1)).reshape(y_val.shape)
+    y_val_pred_unscaled_returns = target_scaler.inverse_transform(y_val_pred_scaled.reshape(-1, 1)).reshape(y_val_pred_scaled.shape)
 
     # Calculate prices
     last_close_feature_index = X_train.shape[2] - 1
@@ -414,11 +366,9 @@ def main():
 
     with open(metrics_filename, "w") as f:
         f.write(f"Symbol: {args.symbol}\n")
-        last_train_seq_start_pos = df.index.get_loc(X_df_processed.index[split_idx - 1])
-        last_train_seq_end_pos = last_train_seq_start_pos + SEQUENCE_LENGTH - 1
-        last_train_sequence_original_end_index = df.index[last_train_seq_end_pos]
-        last_train_close = df.loc[last_train_sequence_original_end_index, 'Close']
-
+        last_train_close = float(X_train[-1, -1, -1])
+        f.write("Evaluation protocol: causal-v2; validation used for early stopping, not untouched test\n")
+        f.write(f"Purged overlapping samples: {split.purged_samples}\n")
         f.write(f"Last Close (train end): ${last_train_close:.2f}\n")
         f.write(f"Overall MAPE: {price_metrics['mape']:.2f}%\n")
         f.write(f"Overall MAE: {price_metrics['mae']:.2f}\n")
@@ -435,4 +385,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 

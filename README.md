@@ -1,3 +1,10 @@
+**Evaluation status:** The causal-v2 repair removes full-dataset scaler fitting,
+future-close inputs, horizon shifts across missing feature rows, and incorrect
+cumulative-return compounding. Historical checkpoints and low-MAPE results are
+legacy artifacts and do not demonstrate held-out accuracy. Ten offline tests
+pass; no model was retrained. Serving rejects legacy bundles until causal-v2
+retraining creates a matching protocol marker. See [the protocol and evidence gaps](docs/CAUSAL_EVALUATION.md).
+
     # Stock Price Prediction 
 
     ##  IMPORTANT DISCLAIMER 

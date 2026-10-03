@@ -17,6 +17,7 @@ from tensorflow.keras import regularizers
 from tensorflow.keras import layers
 import joblib
 import pandas as pd
+from causal import prices_from_returns, estimated_weekday_dates
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -219,7 +220,8 @@ def predict_next_week(
     model: tf.keras.Model,
     target_scaler: MinMaxScaler,
     last_sequence_features: np.ndarray, # Should have shape (1, SEQUENCE_LENGTH, n_features)
-    last_close_price: float
+    last_close_price: float,
+    *, origin_date: str
 ) -> Dict:
     """
     Predict the next PREDICTION_DAYS closing prices.
@@ -244,16 +246,10 @@ def predict_next_week(
         unscaled_return_predictions = target_scaler.inverse_transform(scaled_return_predictions.reshape(-1, 1)).flatten()
 
         # Calculate predicted prices from returns and the last close price
-        predicted_prices = []
-        current_price = last_close_price
-        for return_pred in unscaled_return_predictions:
-            # Calculate the price for the next day based on the predicted return
-            next_price = current_price * (1 + return_pred)
-            predicted_prices.append(next_price)
-            current_price = next_price
+        predicted_prices=prices_from_returns([last_close_price],[unscaled_return_predictions])[0].tolist()
 
         # Generate prediction dates (starting from the day after the last close)
-        prediction_dates = [(datetime.now() + timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(PREDICTION_DAYS)]
+        prediction_dates=estimated_weekday_dates(origin_date,PREDICTION_DAYS)
 
         # Calculate a simple confidence interval (e.g., based on historical volatility or a fixed percentage)
         confidence_intervals = [abs(price * 0.02) for price in predicted_prices] #
@@ -261,7 +257,8 @@ def predict_next_week(
         return {
             "dates": prediction_dates, # Placeholder dates
             "predictions": predicted_prices,
-            "confidence_intervals": confidence_intervals
+            "confidence_intervals": confidence_intervals,
+            "date_basis": "estimated weekdays from forecast origin; exchange holidays not modeled"
         }
 
     except Exception as e:
