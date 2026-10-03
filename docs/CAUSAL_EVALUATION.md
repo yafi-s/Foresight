@@ -30,11 +30,13 @@ python -m unittest discover -s tests -v
 python -m py_compile train.py model.py main.py causal.py artifact_protocol.py data_loader.py
 ```
 
-Ten tests cover future perturbation invariance, close alignment and horizon
+Eleven tests cover future perturbation invariance, close alignment and horizon
 purge, cumulative price anchors, invalid/unsorted input rejection, and label
 alignment across feature gaps, actual API input alignment, cumulative prediction
 reconstruction with a fake model, origin-based dates, bundle identity, and
-train/serve parity when future prices are missing.
+train/serve parity when future prices are missing. Rejected latest observations
+and insufficient history return HTTP 400; missing scalers retain 404. Unexpected
+provider failures still return 500 without invoking a model or writing predictions.
 The tests do not train a model. Validation still selects early stopping; it is
 not an untouched test set. A fresh chronological train/validation/test or
 walk-forward experiment and persistence baseline are needed for accuracy claims.
