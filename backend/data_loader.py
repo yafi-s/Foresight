@@ -190,7 +190,7 @@ def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     return atr
 
 def prepare_features(
-    df: pd.DataFrame
+    df: pd.DataFrame, *, include_targets: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """
     Prepare features and target variables for model training.
@@ -200,8 +200,9 @@ def prepare_features(
     Returns:
         Tuple of (feature DataFrame, target DataFrame, feature column names)
     """
+    original_closes = df["Close"].copy()
     # Calculate returns
-    df['Returns'] = df['Close'].pct_change()
+    df['Returns'] = df['Close'].pct_change(fill_method=None)
     
     # Calculate volatility metrics
     df['Volatility'] = df['Returns'].rolling(window=5).std()  # 5-day volatility
@@ -210,11 +211,11 @@ def prepare_features(
     df['High_Low_Range'] = (df['High'] - df['Low']) / df['Close'].replace(0, np.nan)
     
     # Handle potential division by zero in Volume_Change
-    df['Volume_Change'] = df['Volume'].pct_change()
+    df['Volume_Change'] = df['Volume'].pct_change(fill_method=None)
     
     # Calculate price momentum indicators
-    df['Price_Momentum'] = df['Close'].pct_change(periods=5)
-    df['Volume_Momentum'] = df['Volume'].pct_change(periods=5)
+    df['Price_Momentum'] = df['Close'].pct_change(periods=5, fill_method=None)
+    df['Volume_Momentum'] = df['Volume'].pct_change(periods=5, fill_method=None)
     
     # Calculate Bollinger Bands
     df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -244,17 +245,18 @@ def prepare_features(
     # Debug logging for feature columns and shape
     logger.info(f"prepare_features: Feature columns: {list(X_df.columns)}")
     logger.info(f"prepare_features: Feature shape: {X_df.shape}")
+
+    if not include_targets:
+        # Serving has no future labels and must retain the latest observations.
+        return X_df, pd.DataFrame(index=X_df.index), feature_cols
     
     # Prepare y (target) for multiple days ahead
     y_df = pd.DataFrame(index=df.index)
     for d in range(1, PREDICTION_DAYS + 1):
-        y_df[f'Future_Return_{d}'] = df['Close'].pct_change(periods=d).shift(-d)
+        y_df[f'Future_Return_{d}'] = (original_closes.shift(-d) / original_closes - 1).reindex(df.index)
     
-    # Drop rows with NaN values
-    y_df = y_df.dropna()
-    
-    # Align X with y
-    X_df = X_df.loc[y_df.index]
+    # Retain feature history independently of future-label availability.
+    # causal.prepare_split excludes only origins with incomplete target vectors.
     
     return X_df, y_df, feature_cols
 
